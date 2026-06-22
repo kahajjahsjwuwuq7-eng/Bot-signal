@@ -99,6 +99,9 @@ class QuotexWebSocketClient:
     Streams real-time candle data; falls back to REST providers on failure.
     """
 
+    # Track first-failure so we only log once per session
+    _logged_failure: bool = False
+
     def __init__(self):
         self._ws = None
         self._candle_buffer: dict[str, list] = {}
@@ -109,11 +112,10 @@ class QuotexWebSocketClient:
         """Attempt WebSocket connection to Quotex. Returns True on success."""
         try:
             import websockets
-            logger.info("Connecting to Quotex WebSocket…")
             self._ws = await asyncio.wait_for(
                 websockets.connect(
                     QUOTEX_WS_URI,
-                    extra_headers={
+                    additional_headers={
                         "Origin": QUOTEX_WS_ORIGIN,
                         "User-Agent": (
                             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -126,10 +128,15 @@ class QuotexWebSocketClient:
                 timeout=15,
             )
             self._connected = True
+            QuotexWebSocketClient._logged_failure = False
             logger.info("Quotex WebSocket connected.")
             return True
         except Exception as exc:
-            logger.warning("Quotex WebSocket connection failed: %s", exc)
+            if not QuotexWebSocketClient._logged_failure:
+                logger.warning(
+                    "Quotex WebSocket unavailable (%s) — using backup APIs.", exc
+                )
+                QuotexWebSocketClient._logged_failure = True
             self._connected = False
             return False
 
@@ -213,6 +220,11 @@ class TwelveDataClient:
     def __init__(self, api_key: str = TWELVE_DATA_API_KEY):
         self.api_key = api_key
 
+    # Rate-limit: free tier = 8 req/min → 1 req every 7.5s
+    _call_lock = asyncio.Lock()
+    _last_call_ts: float = 0.0
+    _MIN_CALL_INTERVAL: float = 7.5
+
     @async_retry(max_retries=MAX_RETRIES, delay=2.0)
     async def get_candles(self, pair: str, timeframe: str = "M1",
                           count: int = CANDLE_COUNT) -> Optional[pd.DataFrame]:
@@ -223,6 +235,14 @@ class TwelveDataClient:
         symbol = _TWELVE_DATA_SYMBOLS.get(sym)
         if not symbol:
             return None
+
+        # Rate-limit: free tier allows ~8 req/min
+        async with TwelveDataClient._call_lock:
+            now = asyncio.get_event_loop().time()
+            wait = TwelveDataClient._MIN_CALL_INTERVAL - (now - TwelveDataClient._last_call_ts)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            TwelveDataClient._last_call_ts = asyncio.get_event_loop().time()
 
         interval = _TF_TO_TWELVE.get(timeframe, "1min")
         url = (

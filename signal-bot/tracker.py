@@ -149,9 +149,10 @@ class StatsTracker:
         else:
             header = "➖ DRAW"
 
+        safe_pair = pair.replace("_", " ")
         lines = [
             header,
-            f"📌 {pair} | {dir_emoji}",
+            f"📌 {safe_pair} | {dir_emoji}",
             f"📊 Win Rate: {s.win_rate}% ({s.wins}W / {s.losses}L)",
             f"💰 Total P&L: ${s.pnl:.2f}",
         ]

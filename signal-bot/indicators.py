@@ -439,6 +439,7 @@ def analyse(df: pd.DataFrame) -> AnalysisResult:
     bb_upper, bb_mid, bb_lower = _bollinger(c, BB_PERIOD, BB_STDDEV)
     bb_u = float(bb_upper.iloc[-1]) if not pd.isna(bb_upper.iloc[-1]) else float(c.iloc[-1])
     bb_l = float(bb_lower.iloc[-1]) if not pd.isna(bb_lower.iloc[-1]) else float(c.iloc[-1])
+    bb_m = float(bb_mid.iloc[-1]) if not pd.isna(bb_mid.iloc[-1]) else float(c.iloc[-1])
 
     emas = {}
     for p in EMA_PERIODS:
@@ -470,7 +471,7 @@ def analyse(df: pd.DataFrame) -> AnalysisResult:
 
     # ── Candlestick patterns ──────────────────────────────────────────────────
     candle_pats = detect_candlestick_patterns(o, h, l, c)
-    is_doji = candle_pats["is_doji"]
+    is_doji = bool(candle_pats["is_doji"])
 
     # ── Chart patterns ────────────────────────────────────────────────────────
     chart_pats = detect_chart_patterns(h, l, c)
@@ -490,63 +491,103 @@ def analyse(df: pd.DataFrame) -> AnalysisResult:
     vol_rising = float(v.iloc[-1]) > vol_avg
 
     # ─── Confluence scoring ───────────────────────────────────────────────────
+    # Only indicators that fire for *either* side count toward active.
+    # Neutral indicators are skipped entirely so they don't dilute the score.
     buy_score = 0
     sell_score = 0
     active = 0
 
     def vote(buy_cond: bool, sell_cond: bool, weight: int = 1):
+        """Record a vote only when at least one side fires."""
         nonlocal buy_score, sell_score, active
-        active += weight
-        if buy_cond:
-            buy_score += weight
-        if sell_cond:
-            sell_score += weight
+        if buy_cond or sell_cond:   # skip neutral votes — don't dilute score
+            active += weight
+            if buy_cond:
+                buy_score += weight
+            if sell_cond:
+                sell_score += weight
 
-    # 1. RSI
-    vote(rsi_val < RSI_OVERSOLD, rsi_val > RSI_OVERBOUGHT)
+    # ── Momentum / oscillator indicators ──────────────────────────────────────
+    # 1. RSI — use wider bands for trend-following (40/60) in addition to extreme (30/70)
+    vote(rsi_val < RSI_OVERSOLD, rsi_val > RSI_OVERBOUGHT, weight=2)      # extreme reversal
+    vote(rsi_val < 45, rsi_val > 55, weight=1)                            # directional bias
+
     # 2. Stoch RSI
-    vote(srsi_k_val < STOCH_RSI_OS, srsi_k_val > STOCH_RSI_OB)
-    # 3. Stochastic
-    vote(sk < 20 and sk > sd, sk > 80 and sk < sd)
-    # 4. MACD histogram crossover
-    vote(macd_hist > 0 and macd_val > macd_sig, macd_hist < 0 and macd_val < macd_sig)
-    # 5. Bollinger Bands
-    vote(current_price < bb_l, current_price > bb_u)
-    # 6. EMA stack (9 > 21 > 50 → bullish)
+    vote(srsi_k_val < STOCH_RSI_OS, srsi_k_val > STOCH_RSI_OB, weight=2)
+    vote(srsi_k_val < 45, srsi_k_val > 55, weight=1)                     # directional bias
+
+    # 3. Stochastic — extreme reversal + crossover
+    vote(sk < 20, sk > 80, weight=2)
+    vote(sk < sd and sk < 50, sk > sd and sk > 50, weight=1)             # cross + position
+
+    # 4. MACD — histogram direction (strong signal)
+    vote(macd_hist > 0, macd_hist < 0, weight=2)
+    vote(macd_val > macd_sig, macd_val < macd_sig, weight=1)             # line cross
+
+    # 5. Bollinger Bands — price vs bands
+    vote(current_price < bb_l, current_price > bb_u, weight=2)           # outside band
+    vote(current_price < bb_m, current_price > bb_m, weight=1)           # vs midline
+
+    # ── Trend indicators ──────────────────────────────────────────────────────
+    # 6. EMA stack alignment (strong weight)
     ema_bull = emas[9] > emas[21] > emas[50]
     ema_bear = emas[9] < emas[21] < emas[50]
-    vote(ema_bull, ema_bear)
-    # 7. ADX direction
-    vote(adx_val > ADX_TREND_THRESHOLD and pdi > mdi,
-         adx_val > ADX_TREND_THRESHOLD and mdi > pdi)
-    # 8. Williams %R
-    vote(wr_val < -80, wr_val > -20)
-    # 9. CCI
-    vote(cci_val < -100, cci_val > 100)
-    # 10. Parabolic SAR
-    vote(sar_val < current_price, sar_val > current_price)
-    # 11. OBV trend
-    vote(obv_slope > 0, obv_slope < 0)
-    # 12. Market structure
-    vote(mkt_struct["bullish"], mkt_struct["bearish"])
-    # 13. Candlestick
+    vote(ema_bull, ema_bear, weight=3)
+
+    # 7. Price vs EMAs (each individually)
+    vote(current_price > emas[9], current_price < emas[9], weight=1)
+    vote(current_price > emas[21], current_price < emas[21], weight=1)
+    vote(current_price > emas[50], current_price < emas[50], weight=1)
+
+    # 8. ADX + DI direction (strong momentum signal)
+    vote(pdi > mdi, mdi > pdi, weight=2)                                 # DI cross always counts
+    if adx_val > ADX_TREND_THRESHOLD:
+        vote(pdi > mdi, mdi > pdi, weight=1)                             # extra weight when trending
+
+    # 9. Parabolic SAR (reliable trend follower)
+    vote(sar_val < current_price, sar_val > current_price, weight=2)
+
+    # 10. EMA200 trend bias
+    vote(current_price > emas[200], current_price < emas[200], weight=1)
+
+    # ── Mean-reversion / extremes ─────────────────────────────────────────────
+    # 11. Williams %R
+    vote(wr_val < -80, wr_val > -20, weight=2)
+    vote(wr_val < -60, wr_val > -40, weight=1)                           # softer zone
+
+    # 12. CCI
+    vote(cci_val < -100, cci_val > 100, weight=2)
+    vote(cci_val < -50, cci_val > 50, weight=1)
+
+    # ── Structure / pattern indicators ────────────────────────────────────────
+    # 13. Market structure (HH/HL vs LH/LL)
+    vote(mkt_struct["bullish"], mkt_struct["bearish"], weight=2)
+
+    # 14. Candlestick patterns
     vote(
         candle_pats["bullish_engulfing"] or candle_pats["is_hammer"],
         candle_pats["bearish_engulfing"] or candle_pats["is_shooting_star"],
+        weight=2,
     )
-    # 14. Chart patterns
+
+    # 15. Chart patterns
     vote(
-        chart_pats.get("double_bottom") or chart_pats.get("inv_head_shoulders", False),
-        chart_pats.get("double_top") or chart_pats.get("head_shoulders", False),
+        bool(chart_pats.get("double_bottom") or chart_pats.get("inv_head_shoulders")),
+        bool(chart_pats.get("double_top") or chart_pats.get("head_shoulders")),
+        weight=1,
     )
-    # 15. Breakout
-    vote(bo["bullish_breakout"], bo["bearish_breakout"])
-    # 16. Liquidity sweep
-    vote(liq["sweep_low"], liq["sweep_high"])   # sweep low → reversal BUY
-    # 17. Volume
-    if vol_rising:
-        # volume confirms prevailing bias
-        vote(obv_slope > 0, obv_slope < 0)
+
+    # 16. Breakout
+    vote(bo["bullish_breakout"], bo["bearish_breakout"], weight=2)
+
+    # 17. Liquidity sweep (sweep low → buy the dip; sweep high → sell the rally)
+    vote(liq["sweep_low"], liq["sweep_high"], weight=1)
+
+    # 18. OBV — only include when real volume data exists
+    if float(v.max()) > 0:
+        vote(obv_slope > 0, obv_slope < 0, weight=1)
+        if vol_rising:
+            vote(obv_slope > 0, obv_slope < 0, weight=1)   # extra confirmation
 
     # ─── Determine direction ──────────────────────────────────────────────────
     if buy_score >= sell_score:
@@ -558,28 +599,35 @@ def analyse(df: pd.DataFrame) -> AnalysisResult:
 
     strength = (agreements / active * 100) if active > 0 else 0.0
 
-    # ─── EMA200 trend filter ──────────────────────────────────────────────────
+    # ─── EMA200 trend filter (soft — counted in score, not a hard gate) ────────
     trend_confirm = (
         (direction == "BUY" and current_price > emas[200]) or
         (direction == "SELL" and current_price < emas[200])
     )
 
-    # ─── Volume confirmation ──────────────────────────────────────────────────
-    volume_confirm = vol_rising
+    # ─── Volume confirmation (soft — OTC feeds often return flat volume) ───────
+    # True if volume is non-zero AND rising, or if volume data is unavailable
+    vol_nonzero = bool(float(v.iloc[-1]) > 0)
+    volume_confirm = (not vol_nonzero) or vol_rising   # no data → pass; has data → must be rising
 
     # ─── ATR filter (not too low volatility) ─────────────────────────────────
     atr_pct = atr_val / current_price * 100 if current_price > 0 else 0
-    atr_ok = atr_pct > 0.01  # at least 0.01% move per bar
+    atr_ok = atr_pct > 0.005  # at least 0.005% move per bar (relaxed from 0.01%)
 
     # ─── Signal validity ──────────────────────────────────────────────────────
+    # Hard gates: minimum agreements, minimum strength, minimum ADX, volatility
+    # Doji is advisory — only blocks when strength is borderline
+    # Soft gates: volume and trend — only block when BOTH fail together
+    soft_ok = volume_confirm or trend_confirm
+    strong_enough = agreements >= MIN_INDICATOR_AGREEMENTS and strength >= MIN_STRENGTH_PCT
+    # Allow doji through if signal is strong (strength > 60%)
+    doji_ok = (not is_doji) or (strength >= 60.0)
     valid = (
-        not is_doji and
-        agreements >= MIN_INDICATOR_AGREEMENTS and
-        strength >= MIN_STRENGTH_PCT and
+        doji_ok and
+        strong_enough and
         adx_val >= MIN_ADX and
         atr_ok and
-        volume_confirm and
-        trend_confirm
+        soft_ok
     )
 
     result.direction = direction

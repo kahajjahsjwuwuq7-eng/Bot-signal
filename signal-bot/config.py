@@ -85,9 +85,9 @@ SAR_MAX = 0.2
 ATR_PERIOD = 14
 
 # ─── Scoring thresholds ──────────────────────────────────────────────────────
-MIN_INDICATOR_AGREEMENTS = 5
-MIN_STRENGTH_PCT = 50.0
-MIN_ADX = 25.0
+MIN_INDICATOR_AGREEMENTS = 4
+MIN_STRENGTH_PCT = 45.0
+MIN_ADX = 18.0
 MIN_TIMEFRAMES_AGREE = 2
 
 # ─── Risk buckets ────────────────────────────────────────────────────────────

@@ -64,12 +64,11 @@ class PairSelector:
         """
         Run multi-timeframe analysis for *pair*.
         Returns PairScore if at least MIN_TIMEFRAMES_AGREE agree, else None.
+        Fetches timeframes sequentially to respect API rate limits.
         """
-        # Fetch all timeframes concurrently
-        tasks = {tf: self._analyse_pair_tf(pair, tf) for tf in TIMEFRAMES}
         results: dict[str, Optional[AnalysisResult]] = {}
-        for tf, coro in tasks.items():
-            results[tf] = await coro
+        for tf in TIMEFRAMES:
+            results[tf] = await self._analyse_pair_tf(pair, tf)
 
         valid_results = {
             tf: r for tf, r in results.items() if r is not None

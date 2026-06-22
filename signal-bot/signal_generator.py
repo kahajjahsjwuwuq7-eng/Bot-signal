@@ -53,8 +53,9 @@ class SignalGenerator:
 
     async def announce_pair(self, score: PairScore) -> None:
         """Send the 'best pair selected' announcement."""
+        pair_display = clean_pair_name(score.pair)
         msg = (
-            f"⚠️ *{score.pair}* selected as BEST pair\n"
+            f"⚠️ *{pair_display}* selected as BEST pair\n"
             f"🔥 Confidence: *{score.strength:.0f}%*\n"
             f"📡 Direction: *{score.direction}*\n"
             f"⏳ Preparing signal..."
@@ -72,6 +73,13 @@ class SignalGenerator:
 
     # ─── Step 3: Signal message ──────────────────────────────────────────────
 
+    @staticmethod
+    def _escape(text: str) -> str:
+        """Escape Markdown special chars in dynamic text."""
+        for ch in ("_", "*", "[", "]", "`"):
+            text = text.replace(ch, f"\\{ch}")
+        return text
+
     def _build_signal_message(self, score: PairScore) -> str:
         now = now_pkt()
         time_str = fmt_time_only(now)
@@ -84,24 +92,25 @@ class SignalGenerator:
 
         risk = risk_label(score.strength)
         confluence = f"{score.agreements}/{score.active_indicators}"
+        structure = list(score.tf_results.values())[0].market_structure
 
         lines = [
             f"📊 *{pair_display}*",
-            f"",
-            f"✔️ Time  : *{time_str}* (PKT 🇵🇰)",
-            f"⏳ Frame : *{self.timeframe}* 🤔",
-            f"",
+            "",
+            f"✔️ Time  : {time_str} (PKT 🇵🇰)",
+            f"⏳ Frame : {self.timeframe}",
+            "",
             direction_line,
-            f"",
-            f"⚡️ AVOID DOJI CANDLES ⚡️",
-            f"📺 NON SIGNAL MTG",
-            f"",
+            "",
+            "⚡️ AVOID DOJI CANDLES ⚡️",
+            "📺 NON SIGNAL MTG",
+            "",
             f"🔥 Strength   : *{score.strength:.0f}%*",
-            f"📊 Confluence : *{confluence}*",
+            f"📊 Confluence : {confluence}",
             f"🎯 Risk Level : {risk}",
-            f"📈 ADX        : *{score.adx:.1f}*",
-            f"📡 TFs Agree  : *{score.timeframes_agree}/{len(score.tf_results)}*",
-            f"🏗 Structure  : *{list(score.tf_results.values())[0].market_structure}*",
+            f"📈 ADX        : {score.adx:.1f}",
+            f"📡 TFs Agree  : {score.timeframes_agree}/{len(score.tf_results)}",
+            f"🏗 Structure  : {self._escape(structure)}",
         ]
         return "\n".join(lines)
 
@@ -189,8 +198,16 @@ class SignalGenerator:
         """Execute the full signal lifecycle for *score*."""
         logger.info("=== Signal cycle start: %s ===", score.pair)
 
-        # 1. Capture entry price before countdown
-        entry_price = await self.provider.get_current_price(score.pair)
+        # 1. Capture entry price — retry up to 3 times with back-off
+        #    (rate-limiter may still be recovering after the big scan)
+        entry_price: Optional[float] = None
+        for attempt in range(3):
+            entry_price = await self.provider.get_current_price(score.pair)
+            if entry_price is not None:
+                break
+            if attempt < 2:
+                logger.debug("Entry price retry %d/3 for %s…", attempt + 1, score.pair)
+                await asyncio.sleep(8)
         logger.info("Entry price for %s: %s", score.pair, entry_price)
 
         # 2. Announce
