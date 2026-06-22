@@ -11,6 +11,26 @@ env = { "CI" = "true" }
 [workflows]
 runButton = "Project"
 
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Quotex Signal Bot"
+
+[[workflows.workflow]]
+name = "Quotex Signal Bot"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "cd signal-bot && pip install -r requirements.txt -q && python telegram_bot.py"
+
+[workflows.workflow.metadata]
+outputType = "console"
+
 [agent]
 stack = "PNPM_WORKSPACE"
 expertMode = true
@@ -26,3 +46,10 @@ externalPort = 80
 [[ports]]
 localPort = 8081
 externalPort = 8081
+
+[userenv]
+
+[userenv.shared]
+TWELVE_DATA_API_KEY = "6ea3052e44854e5bab8196b3f0e2289f"
+ALPHA_VANTAGE_API_KEY = "KZIXNMYIFFFFXX7H"
+FINNHUB_API_KEY = "d25bvkpr01qns40e7jggd25bvkpr01qns40e7jh0"

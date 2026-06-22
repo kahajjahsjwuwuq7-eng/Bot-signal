@@ -1,45 +1,79 @@
-# [Project name]
+# Advanced Quotex Signal Bot
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+A production-ready Python 3.11 Telegram bot that scans 11 OTC pairs every minute, selects the highest-confidence trade setup using 20+ technical indicators, sends professional signals to Telegram, tracks results, and runs 24/7.
 
 ## Run & Operate
 
-- `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
-- `pnpm run typecheck` — full typecheck across all packages
-- `pnpm run build` — typecheck + build all packages
-- `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
-- `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+- `cd signal-bot && python telegram_bot.py` — run the bot
+- `cd signal-bot && pip install -r requirements.txt` — install dependencies
+- `playwright install chromium` — install browser (for Quotex WS login)
+- Workflow: **"Quotex Signal Bot"** — managed long-running process
 
 ## Stack
 
-- pnpm workspaces, Node.js 24, TypeScript 5.9
-- API: Express 5
-- DB: PostgreSQL + Drizzle ORM
-- Validation: Zod (`zod/v4`), `drizzle-zod`
-- API codegen: Orval (from OpenAPI spec)
-- Build: esbuild (CJS bundle)
+- Python 3.11, asyncio, aiohttp
+- python-telegram-bot 20.x
+- pandas + pandas-ta (indicators)
+- playwright (Chromium for Quotex WebSocket auth)
+- Fallback APIs: TwelveData, Alpha Vantage, Finnhub
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- `signal-bot/telegram_bot.py` — main entry point, command handlers, scan loop
+- `signal-bot/pair_selector.py` — multi-TF pair scanner + confluence scoring
+- `signal-bot/signal_generator.py` — full signal lifecycle (announce → countdown → signal → result)
+- `signal-bot/indicators.py` — 20+ indicators, patterns, market structure
+- `signal-bot/quotex_client.py` — data provider chain (Quotex WS → TwelveData → AV → Finnhub)
+- `signal-bot/tracker.py` — win/loss/P&L persistence to stats.json
+- `signal-bot/config.py` — all tuning parameters in one place
+- `signal-bot/utils.py` — logging, PKT timezone, retry decorator
 
 ## Architecture decisions
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- **Fully async** — all IO uses asyncio + aiohttp; no blocking calls
+- **Data fallback chain** — Quotex WS first, then TwelveData, AV, Finnhub; skip if all fail
+- **Confluence scoring** — strength = (agreeing indicators / total active) × 100
+- **Multi-TF gating** — signal only fires if M1 + M5 + M15 agree (min 2/3)
+- **All timestamps in PKT** (UTC+5 / Asia/Karachi)
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+- Scans 11 OTC pairs every 60s
+- Runs M1/M5/M15 analysis in parallel
+- Selects highest-confidence pair (min 50% strength)
+- Sends announcement → countdown → signal → wait → WIN/LOSS/DRAW result
+- Supports multi-chat broadcast (/subscribe command)
+- Tracks cumulative win rate and P&L in stats.json
 
 ## User preferences
 
-_Populate as you build — explicit user instructions worth remembering across sessions._
+- All timestamps in Pakistan Standard Time (PKT = UTC+5)
+- Signal format must match the template exactly (UP/DOWN emojis, Confluence fraction)
+- Risk levels: LOW >70%, MEDIUM 60-70%, HIGH 50-60%
+- Default stake: $10.00 per signal
+
+## Required Environment Variables
+
+| Variable | Status |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | ❗ Must be provided |
+| `TELEGRAM_CHAT_ID` | ❗ Must be provided |
+| `TELEGRAM_CHANNEL_ID` | Optional |
+| `QUOTEX_EMAIL` | Optional (for live WS) |
+| `QUOTEX_PASSWORD` | Optional (for live WS) |
+| `TWELVE_DATA_API_KEY` | ✅ Configured |
+| `ALPHA_VANTAGE_API_KEY` | ✅ Configured |
+| `FINNHUB_API_KEY` | ✅ Configured |
 
 ## Gotchas
 
-_Populate as you build — sharp edges, "always run X before Y" rules._
+- The bot will NOT start without `TELEGRAM_BOT_TOKEN` set in Secrets
+- Without Quotex credentials, it falls back automatically to TwelveData (configured)
+- `pandas-ta` must be installed BEFORE `ta` to avoid import conflicts
+- Always run `pip install -r requirements.txt` before first start
 
 ## Pointers
 
-- See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details
+- See `signal-bot/config.py` for all tunable parameters (periods, thresholds, pairs)
+- See `signal-bot/stats.json` for running win/loss statistics
+- See `signal-bot/logs/bot.log` for full debug log
