@@ -198,17 +198,24 @@ class SignalGenerator:
         """Execute the full signal lifecycle for *score*."""
         logger.info("=== Signal cycle start: %s ===", score.pair)
 
-        # 1. Capture entry price — retry up to 3 times with back-off
-        #    (rate-limiter may still be recovering after the big scan)
+        # 1. Capture entry price — use the close already in the scan result (no extra API call).
+        #    Fall back to a fresh fetch only if the scan close is missing.
         entry_price: Optional[float] = None
-        for attempt in range(3):
-            entry_price = await self.provider.get_current_price(score.pair)
-            if entry_price is not None:
-                break
-            if attempt < 2:
-                logger.debug("Entry price retry %d/3 for %s…", attempt + 1, score.pair)
-                await asyncio.sleep(8)
-        logger.info("Entry price for %s: %s", score.pair, entry_price)
+        primary_result = score.tf_results.get(self.timeframe) or next(
+            iter(score.tf_results.values()), None
+        )
+        if primary_result and primary_result.close > 0:
+            entry_price = primary_result.close
+            logger.info("Entry price for %s from scan: %.6f", score.pair, entry_price)
+        else:
+            # Fallback: fresh API call with a short back-off
+            for attempt in range(3):
+                entry_price = await self.provider.get_current_price(score.pair)
+                if entry_price is not None:
+                    break
+                if attempt < 2:
+                    await asyncio.sleep(8)
+            logger.info("Entry price for %s (fetched): %s", score.pair, entry_price)
 
         # 2. Announce
         await self.announce_pair(score)

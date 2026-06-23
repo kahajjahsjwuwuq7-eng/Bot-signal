@@ -450,10 +450,11 @@ class DataProvider:
             ("Finnhub", self.finnhub.get_candles),
         ]
 
+        min_rows = min(count, 30)   # price-only fetches (count≤10) don't need 30 rows
         for name, fn in sources:
             try:
                 df = await fn(pair, timeframe, count)
-                if df is not None and len(df) >= 30:
+                if df is not None and len(df) >= min_rows:
                     logger.debug("Data from %s for %s/%s (%d rows)", name, pair, timeframe, len(df))
                     return df
             except Exception as exc:
