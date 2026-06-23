@@ -1,12 +1,10 @@
 """
 signal_generator.py — Orchestrates the full signal lifecycle:
-  1. Announce best pair
-  2. Countdown
-  3. Send formatted signal
-  4. Wait for candle expiry
-  5. Determine WIN / LOSS / DRAW
-  6. Send result message
-  7. Update stats
+  1. Send signal (15s before candle opens)
+  2. Wait 75s (15s prep + 60s M1 expiry)
+  3. Determine WIN / LOSS / DRAW
+  4. Send result message
+  5. Update stats
 """
 
 from __future__ import annotations
@@ -20,21 +18,29 @@ from config import (
 from pair_selector import PairScore
 from quotex_client import DataProvider
 from tracker import StatsTracker
-from utils import (
-    logger, now_pkt, fmt_time_only, fmt_pkt,
-    clean_pair_name, flag_for_pair, risk_label,
-)
+from utils import logger, now_pkt, fmt_time_only
 
-# Type alias for a "send message" callback
 SendFn = Callable[[str], Awaitable[None]]
+
+# Unicode bold italic header strings (as user requested)
+_HEADER   = "𝙌𝙐𝙊𝙏𝙀𝙓 𝘽𝙍𝙊𝙆𝙀𝙍"
+_AVOID    = "⚡️  𝘼𝙑𝙊𝙄𝘿 𝘿𝙊𝙅𝙄 𝘾𝘼𝙉𝘿𝙇𝙀𝙎  ⚡️"
+
+# Seconds the user has to place the trade before candle opens
+PREP_SECONDS = 15
+
+
+def _fmt_signal_pair(pair: str) -> str:
+    """'EURUSD_otc' → 'EURUSD OTC'"""
+    return pair.replace("_otc", " OTC").replace("_OTC", " OTC").upper()
+
+
+def _fmt_result_pair(pair: str) -> str:
+    """'EURUSD_otc' → 'EURUSD'"""
+    return pair.replace("_otc", "").replace("_OTC", "").upper()
 
 
 class SignalGenerator:
-    """
-    Drives the full signal lifecycle for a given PairScore.
-    Calls *send_fn* to push messages to Telegram.
-    """
-
     def __init__(
         self,
         provider: DataProvider,
@@ -43,74 +49,34 @@ class SignalGenerator:
         timeframe: str = PRIMARY_TIMEFRAME,
         stake: float = DEFAULT_STAKE,
     ):
-        self.provider = provider
-        self.tracker = tracker
-        self.send = send_fn
+        self.provider  = provider
+        self.tracker   = tracker
+        self.send      = send_fn
         self.timeframe = timeframe
-        self.stake = stake
+        self.stake     = stake
 
-    # ─── Step 1: Announce ────────────────────────────────────────────────────
-
-    async def announce_pair(self, score: PairScore) -> None:
-        """Send the 'best pair selected' announcement."""
-        pair_display = clean_pair_name(score.pair)
-        msg = (
-            f"⚠️ *{pair_display}* selected as BEST pair\n"
-            f"🔥 Confidence: *{score.strength:.0f}%*\n"
-            f"📡 Direction: *{score.direction}*\n"
-            f"⏳ Preparing signal..."
-        )
-        await self.send(msg)
-        logger.info("Announced pair: %s | %s | %.1f%%", score.pair, score.direction, score.strength)
-
-    # ─── Step 2: Countdown ───────────────────────────────────────────────────
-
-    async def countdown(self, seconds: int = 10) -> None:
-        """Send a single countdown message (10 → 1)."""
-        nums = " ".join(str(i) for i in range(seconds, 0, -1))
-        await self.send(f"⏱ *Signal in:*\n`{nums}`")
-        await asyncio.sleep(seconds)
-
-    # ─── Step 3: Signal message ──────────────────────────────────────────────
-
-    @staticmethod
-    def _escape(text: str) -> str:
-        """Escape Markdown special chars in dynamic text."""
-        for ch in ("_", "*", "[", "]", "`"):
-            text = text.replace(ch, f"\\{ch}")
-        return text
+    # ─── Signal message ───────────────────────────────────────────────────────
 
     def _build_signal_message(self, score: PairScore) -> str:
-        now = now_pkt()
-        time_str = fmt_time_only(now)
-        pair_display = clean_pair_name(score.pair)
+        time_str     = fmt_time_only(now_pkt())
+        pair_display = _fmt_signal_pair(score.pair)
 
         if score.direction == "BUY":
-            direction_line = "💀 *GO FOR UP* 🔼"
+            direction_line = "💀 GO FOR UP 🔼"
         else:
-            direction_line = "💀 *GO FOR DOWN* 🔽"
-
-        risk = risk_label(score.strength)
-        confluence = f"{score.agreements}/{score.active_indicators}"
-        structure = list(score.tf_results.values())[0].market_structure
+            direction_line = "💀 GO FOR DOWN 🔽"
 
         lines = [
-            f"📊 *{pair_display}*",
+            _HEADER,
+            "",
+            f"📊 {pair_display}",
             "",
             f"✔️ Time  : {time_str} (PKT 🇵🇰)",
             f"⏳ Frame : {self.timeframe}",
             "",
             direction_line,
             "",
-            "⚡️ AVOID DOJI CANDLES ⚡️",
-            "📺 NON SIGNAL MTG",
-            "",
-            f"🔥 Strength   : *{score.strength:.0f}%*",
-            f"📊 Confluence : {confluence}",
-            f"🎯 Risk Level : {risk}",
-            f"📈 ADX        : {score.adx:.1f}",
-            f"📡 TFs Agree  : {score.timeframes_agree}/{len(score.tf_results)}",
-            f"🏗 Structure  : {self._escape(structure)}",
+            _AVOID,
         ]
         return "\n".join(lines)
 
@@ -123,34 +89,35 @@ class SignalGenerator:
             score.pair, score.direction, score.strength,
         )
 
-    # ─── Step 4: Wait for expiry ─────────────────────────────────────────────
+    # ─── Wait for expiry ─────────────────────────────────────────────────────
 
     async def wait_expiry(self) -> None:
-        wait_secs = TIMEFRAME_SECONDS.get(self.timeframe, 60)
-        logger.info("Waiting %ds for candle expiry (%s)…", wait_secs, self.timeframe)
-        await asyncio.sleep(wait_secs)
+        """Wait PREP_SECONDS + candle duration so result is after candle close."""
+        candle_secs = TIMEFRAME_SECONDS.get(self.timeframe, 60)
+        total = PREP_SECONDS + candle_secs
+        logger.info(
+            "Waiting %ds (%ds prep + %ds candle) for result…",
+            total, PREP_SECONDS, candle_secs,
+        )
+        await asyncio.sleep(total)
 
-    # ─── Step 5: Determine result ────────────────────────────────────────────
+    # ─── Determine result ────────────────────────────────────────────────────
 
     async def determine_result(
         self, score: PairScore, entry_price: Optional[float]
     ) -> str:
-        """
-        Fetch current price after expiry and compare to *entry_price*.
-        Returns 'WIN', 'LOSS', or 'DRAW'.
-        """
         if entry_price is None:
-            logger.warning("No entry price recorded — marking DRAW")
+            logger.warning("No entry price — marking DRAW")
             return "DRAW"
 
         try:
             exit_price = await self.provider.get_current_price(score.pair)
             if exit_price is None:
-                logger.warning("Could not get exit price for %s — marking DRAW", score.pair)
+                logger.warning("No exit price for %s — marking DRAW", score.pair)
                 return "DRAW"
 
             diff = exit_price - entry_price
-            pct = abs(diff) / entry_price * 100
+            pct  = abs(diff) / entry_price * 100
 
             if pct < 0.001:
                 result = "DRAW"
@@ -169,22 +136,14 @@ class SignalGenerator:
             logger.error("Error determining result: %s", exc)
             return "DRAW"
 
-    # ─── Step 6: Send result ─────────────────────────────────────────────────
+    # ─── Send result ─────────────────────────────────────────────────────────
 
-    async def send_result(
-        self, score: PairScore, result: str
-    ) -> None:
+    async def send_result(self, score: PairScore, result: str) -> None:
         snap = await self.tracker.record_result(
-            result,           # type: ignore[arg-type]
-            score.pair,
-            score.direction,
-            self.stake,
+            result, score.pair, score.direction, self.stake,
         )
         msg = self.tracker.build_result_message(
-            result,           # type: ignore[arg-type]
-            score.pair,
-            score.direction,
-            self.stake,
+            result, score.pair, score.direction, self.stake,
         )
         await self.send(msg)
         logger.info(
@@ -192,14 +151,12 @@ class SignalGenerator:
             result, snap["win_rate"], snap["pnl"],
         )
 
-    # ─── Full lifecycle ──────────────────────────────────────────────────────
+    # ─── Full lifecycle ───────────────────────────────────────────────────────
 
     async def run_signal_cycle(self, score: PairScore) -> None:
-        """Execute the full signal lifecycle for *score*."""
         logger.info("=== Signal cycle start: %s ===", score.pair)
 
-        # 1. Capture entry price — use the close already in the scan result (no extra API call).
-        #    Fall back to a fresh fetch only if the scan close is missing.
+        # 1. Capture entry price from scan result (no extra API call)
         entry_price: Optional[float] = None
         primary_result = score.tf_results.get(self.timeframe) or next(
             iter(score.tf_results.values()), None
@@ -208,7 +165,6 @@ class SignalGenerator:
             entry_price = primary_result.close
             logger.info("Entry price for %s from scan: %.6f", score.pair, entry_price)
         else:
-            # Fallback: fresh API call with a short back-off
             for attempt in range(3):
                 entry_price = await self.provider.get_current_price(score.pair)
                 if entry_price is not None:
@@ -217,23 +173,16 @@ class SignalGenerator:
                     await asyncio.sleep(8)
             logger.info("Entry price for %s (fetched): %s", score.pair, entry_price)
 
-        # 2. Announce
-        await self.announce_pair(score)
-        await asyncio.sleep(2)
-
-        # 3. Countdown
-        await self.countdown(10)
-
-        # 4. Send signal
+        # 2. Send signal immediately (user has PREP_SECONDS to place trade)
         await self.send_signal(score)
 
-        # 5. Wait expiry
+        # 3. Wait prep + candle duration
         await self.wait_expiry()
 
-        # 6. Determine result
+        # 4. Determine result
         result = await self.determine_result(score, entry_price)
 
-        # 7. Send result
+        # 5. Send result
         await self.send_result(score, result)
 
         logger.info("=== Signal cycle complete: %s → %s ===", score.pair, result)

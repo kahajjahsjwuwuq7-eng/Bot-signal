@@ -140,7 +140,8 @@ class StatsTracker:
         stake: float = DEFAULT_STAKE,
     ) -> str:
         s = self._stats
-        dir_emoji = "🟢 BUY" if direction.upper() == "BUY" else "🔴 SELL"
+        dir_emoji  = "🟢 BUY" if direction.upper() == "BUY" else "🔴 SELL"
+        clean_pair = pair.replace("_otc", "").replace("_OTC", "").upper()
 
         if result == "WIN":
             header = f"✅ WIN! +${stake:.2f}"
@@ -149,12 +150,15 @@ class StatsTracker:
         else:
             header = "➖ DRAW"
 
-        safe_pair = pair.replace("_", " ")
+        pnl       = s.pnl
+        pnl_str   = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+
         lines = [
             header,
-            f"📌 {safe_pair} | {dir_emoji}",
-            f"📊 Win Rate: {s.win_rate}% ({s.wins}W / {s.losses}L)",
-            f"💰 Total P&L: ${s.pnl:.2f}",
+            "",
+            f"📌 {clean_pair} | {dir_emoji}",
+            f"📊 Win Rate: {s.win_rate}%  ({s.wins}W / {s.losses}L)",
+            f"💰 Total P&L: {pnl_str}",
         ]
         return "\n".join(lines)
 
