@@ -47,7 +47,6 @@ from tracker import StatsTracker
 from utils import logger, now_pkt, fmt_pkt, clean_pair_name, risk_label
 
 # ─── Subscriber list ─────────────────────────────────────────────────────────
-# Loaded from / persisted to subscribers.json
 SUBSCRIBERS_FILE = "subscribers.json"
 
 
@@ -58,7 +57,6 @@ def load_subscribers() -> set[str]:
                 return set(json.load(f))
         except Exception:
             pass
-    # Default to configured IDs
     subs = set()
     if TELEGRAM_CHAT_ID:
         subs.add(TELEGRAM_CHAT_ID)
@@ -77,6 +75,49 @@ def save_subscribers(subs: set[str]) -> None:
 
 subscribers: set[str] = load_subscribers()
 
+
+# ─── Channel list (admin-managed, persistent) ─────────────────────────────────
+CHANNELS_FILE = "channels.json"
+
+
+def load_channels() -> dict[str, str]:
+    """Load channels dict: {channel_id: label}"""
+    if os.path.exists(CHANNELS_FILE):
+        try:
+            with open(CHANNELS_FILE) as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+                # legacy list format
+                return {str(c): str(c) for c in data}
+        except Exception:
+            pass
+    # Pre-seed from env if set
+    ch: dict[str, str] = {}
+    if TELEGRAM_CHANNEL_ID:
+        ch[TELEGRAM_CHANNEL_ID] = TELEGRAM_CHANNEL_ID
+    return ch
+
+
+def save_channels(ch: dict[str, str]) -> None:
+    try:
+        with open(CHANNELS_FILE, "w") as f:
+            json.dump(ch, f, indent=2)
+    except Exception as exc:
+        logger.error("Failed to save channels: %s", exc)
+
+
+channels: dict[str, str] = load_channels()   # {channel_id: label}
+
+
+# ─── Admin check ──────────────────────────────────────────────────────────────
+
+def _is_admin(update: Update) -> bool:
+    """True only if the message comes from the owner (TELEGRAM_CHAT_ID)."""
+    uid = str(update.effective_user.id) if update.effective_user else ""
+    cid = str(update.effective_chat.id) if update.effective_chat else ""
+    return uid == TELEGRAM_CHAT_ID or cid == TELEGRAM_CHAT_ID
+
 # ─── Global shared state ──────────────────────────────────────────────────────
 provider = DataProvider()
 tracker = StatsTracker(STATS_FILE)
@@ -90,16 +131,16 @@ _running = True
 # ─── Broadcast helper ─────────────────────────────────────────────────────────
 
 async def broadcast(text: str, parse_mode: str = ParseMode.MARKDOWN) -> None:
-    """Send *text* to all subscribers."""
+    """Send *text* to all subscribers AND all admin-added channels."""
     if bot_app is None:
         logger.warning("bot_app not ready — skipping broadcast")
         return
 
-    targets = set(subscribers)
+    targets: set[str] = set(subscribers)
     if TELEGRAM_CHAT_ID:
         targets.add(TELEGRAM_CHAT_ID)
-    if TELEGRAM_CHANNEL_ID:
-        targets.add(TELEGRAM_CHANNEL_ID)
+    # Add every admin-registered channel
+    targets.update(channels.keys())
 
     for chat_id in targets:
         try:
@@ -133,19 +174,32 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    admin = _is_admin(update)
     msg = (
         "📋 *BOT COMMANDS*\n"
         "─────────────────────\n"
-        "/start       — Welcome message\n"
-        "/help        — This help menu\n"
-        "/status      — Bot health & data sources\n"
-        "/signal      — Force immediate scan & signal\n"
-        "/subscribe   — Add this chat to broadcasts\n"
-        "/unsubscribe — Remove this chat from broadcasts\n"
-        "/stats       — Win/loss statistics\n"
-        "/pairs       — List all monitored pairs\n"
-        "/settings    — Current bot configuration\n"
+        "/start          — Welcome message\n"
+        "/help           — This help menu\n"
+        "/status         — Bot health & data sources\n"
+        "/signal         — Force immediate scan & signal\n"
+        "/subscribe      — Add this chat to broadcasts\n"
+        "/unsubscribe    — Remove this chat from broadcasts\n"
+        "/stats          — Win/loss statistics\n"
+        "/pairs          — List all monitored pairs\n"
+        "/settings       — Current bot configuration\n"
     )
+    if admin:
+        msg += (
+            "\n"
+            "👑 *ADMIN — CHANNEL MANAGEMENT*\n"
+            "─────────────────────\n"
+            "/addchannel `<id>`    — Add a channel (bot must be admin there)\n"
+            "/removechannel `<id>` — Remove a channel\n"
+            "/channels             — List all registered channels\n"
+            "\n"
+            "_Tip: channel IDs look like_ `-100xxxxxxxxxx`\n"
+            "_Make sure the bot is admin in the channel first!_"
+        )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
@@ -155,13 +209,14 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     msg = (
         f"🤖 *BOT STATUS*\n"
         f"─────────────────────\n"
-        f"🕐 Time      : {fmt_pkt()}\n"
-        f"🔄 Scanner   : {tf_status}\n"
-        f"📡 Sources   : Quotex → TwelveData → AV → Finnhub\n"
-        f"📊 Signals   : {s['total_signals']}\n"
-        f"🎯 Win Rate  : {s['win_rate']}%\n"
-        f"💰 P&L       : ${s['pnl']:.2f}\n"
+        f"🕐 Time       : {fmt_pkt()}\n"
+        f"🔄 Scanner    : {tf_status}\n"
+        f"📡 Sources    : Quotex → TwelveData → AV → Finnhub\n"
+        f"📊 Signals    : {s['total_signals']}\n"
+        f"🎯 Win Rate   : {s['win_rate']}%\n"
+        f"💰 P&L        : ${s['pnl']:.2f}\n"
         f"👥 Subscribers: {len(subscribers)}\n"
+        f"📢 Channels   : {len(channels)}\n"
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
@@ -219,6 +274,115 @@ async def cmd_pairs(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     for i, p in enumerate(PAIRS, 1):
         lines.append(f"{i:2}. `{p}`")
     lines.append(f"\n_Scanned every {SCAN_INTERVAL_SECONDS}s_")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_addchannel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin only — add a Telegram channel to the broadcast list."""
+    if not _is_admin(update):
+        await update.message.reply_text("⛔ This command is for the bot admin only.")
+        return
+
+    args = ctx.args
+    if not args:
+        await update.message.reply_text(
+            "❌ Usage: `/addchannel -100xxxxxxxxxx`\n\n"
+            "_Make sure the bot is already an admin in that channel._",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    channel_id = args[0].strip()
+
+    # Validate the bot can actually reach the channel
+    try:
+        chat = await bot_app.bot.get_chat(channel_id)
+        label = chat.title or channel_id
+    except TelegramError as exc:
+        await update.message.reply_text(
+            f"❌ Could not reach `{channel_id}`.\n\n"
+            f"Make sure:\n"
+            f"• The ID is correct (e.g. `-100xxxxxxxxxx`)\n"
+            f"• The bot is added as an *admin* in the channel\n\n"
+            f"Error: `{exc}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    if channel_id in channels:
+        await update.message.reply_text(
+            f"✅ *{label}* is already registered.\n`{channel_id}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    channels[channel_id] = label
+    save_channels(channels)
+    logger.info("Channel added: %s (%s)", channel_id, label)
+
+    await update.message.reply_text(
+        f"✅ *Channel added successfully!*\n\n"
+        f"📢 *{label}*\n"
+        f"🆔 `{channel_id}`\n\n"
+        f"All future signals will now be broadcast to this channel automatically.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cmd_removechannel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin only — remove a channel from the broadcast list."""
+    if not _is_admin(update):
+        await update.message.reply_text("⛔ This command is for the bot admin only.")
+        return
+
+    args = ctx.args
+    if not args:
+        await update.message.reply_text(
+            "❌ Usage: `/removechannel -100xxxxxxxxxx`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    channel_id = args[0].strip()
+    if channel_id not in channels:
+        await update.message.reply_text(
+            f"⚠️ Channel `{channel_id}` is not in the list.\n"
+            f"Use /channels to see registered channels.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    label = channels.pop(channel_id)
+    save_channels(channels)
+    logger.info("Channel removed: %s (%s)", channel_id, label)
+
+    await update.message.reply_text(
+        f"✅ *Removed:* {label}\n`{channel_id}`\n\n"
+        f"This channel will no longer receive signals.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cmd_channels(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin only — list all registered channels."""
+    if not _is_admin(update):
+        await update.message.reply_text("⛔ This command is for the bot admin only.")
+        return
+
+    if not channels:
+        await update.message.reply_text(
+            "📭 *No channels registered yet.*\n\n"
+            "Use `/addchannel -100xxxxxxxxxx` to add one.\n"
+            "_Make sure the bot is admin in the channel first._",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    lines = ["📢 *REGISTERED CHANNELS*", "─────────────────────"]
+    for i, (cid, label) in enumerate(channels.items(), 1):
+        lines.append(f"{i}. *{label}*\n    `{cid}`")
+    lines.append(f"\n_Total: {len(channels)} channel(s) — signals sent to all automatically._")
+
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
@@ -400,6 +564,10 @@ def main() -> None:
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("pairs", cmd_pairs))
     app.add_handler(CommandHandler("settings", cmd_settings))
+    # Admin — channel management
+    app.add_handler(CommandHandler("addchannel", cmd_addchannel))
+    app.add_handler(CommandHandler("removechannel", cmd_removechannel))
+    app.add_handler(CommandHandler("channels", cmd_channels))
 
     # Run the bot (blocks until Ctrl+C)
     logger.info("Starting polling…")
