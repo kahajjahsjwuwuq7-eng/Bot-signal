@@ -25,6 +25,7 @@ from config import (
     QUOTEX_EMAIL, QUOTEX_PASSWORD, QUOTEX_IS_DEMO,
     QUOTEX_WS_URI, QUOTEX_WS_ORIGIN,
     TWELVE_DATA_API_KEY, ALPHA_VANTAGE_API_KEY, FINNHUB_API_KEY,
+    EXCHANGERATE_HOST_KEY,
     HTTP_TIMEOUT, WS_RECONNECT_DELAY, MAX_RETRIES, CANDLE_COUNT,
     TIMEFRAME_SECONDS,
 )
@@ -506,20 +507,152 @@ class FinnhubClient:
             return None
 
 
+# ─── Frankfurter spot-rate client (free, no key, ECB-blended) ────────────────
+
+class FrankfurterClient:
+    """
+    Real-time blended spot rates from https://api.frankfurter.dev/v2.
+    Free, no API key. Covers all major forex pairs; NOT crypto or gold.
+    Used to patch the last-bar close price after Yahoo Finance OHLCV fetch.
+    """
+
+    BASE = "https://api.frankfurter.dev/v2"
+
+    # Pairs supported as base/quote strings
+    _SUPPORTED: dict[str, tuple[str, str]] = {
+        "EURUSD": ("EUR", "USD"), "GBPUSD": ("GBP", "USD"),
+        "AUDUSD": ("AUD", "USD"), "USDJPY": ("USD", "JPY"),
+        "EURJPY": ("EUR", "JPY"), "USDCAD": ("USD", "CAD"),
+        "AUDCAD": ("AUD", "CAD"), "EURGBP": ("EUR", "GBP"),
+    }
+
+    async def get_spot_rate(self, pair: str) -> Optional[float]:
+        sym = base_pair(pair)
+        mapping = self._SUPPORTED.get(sym)
+        if not mapping:
+            return None
+        base, quote = mapping
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{self.BASE}/rate/{base}/{quote}",
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+            rate = data.get("rate")
+            return float(rate) if rate else None
+        except Exception as exc:
+            logger.debug("Frankfurter spot failed for %s: %s", pair, exc)
+            return None
+
+
+# ─── ExchangeRate.host spot-rate client (live market rates, API key) ──────────
+
+class ExchangeRateHostClient:
+    """
+    Live forex spot rates from ExchangeRate.host.
+    Requires EXCHANGERATE_HOST_KEY. Returns rates vs USD base, then
+    cross-derives any pair. Covers forex + crypto; NOT gold (XAU).
+    Caches the full quote table for 30 s to avoid redundant calls.
+    """
+
+    _LIVE_URL = "https://api.exchangerate.host/live"
+    _CACHE_TTL = 30.0   # seconds
+
+    def __init__(self, api_key: str = EXCHANGERATE_HOST_KEY):
+        self.api_key = api_key
+        self._quotes: dict[str, float] = {}
+        self._cache_ts: float = 0.0
+        self._lock = asyncio.Lock()
+
+    async def _refresh(self) -> bool:
+        """Fetch the full USD-based quote table; return True on success."""
+        if not self.api_key:
+            return False
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    self._LIVE_URL,
+                    params={"access_key": self.api_key, "source": "USD"},
+                    timeout=aiohttp.ClientTimeout(total=6),
+                ) as resp:
+                    data = await resp.json(content_type=None)
+
+            quotes = data.get("quotes") or data.get("rates") or {}
+            if not quotes:
+                # Try alternate key format (some plans use base rates directly)
+                if isinstance(data, dict) and "USD" in str(data):
+                    quotes = {k: v for k, v in data.items()
+                              if isinstance(v, (int, float))}
+            if quotes:
+                self._quotes = {k.upper(): float(v) for k, v in quotes.items()}
+                self._cache_ts = time.time()
+                return True
+        except Exception as exc:
+            logger.debug("ExchangeRate.host refresh failed: %s", exc)
+        return False
+
+    async def get_spot_rate(self, pair: str) -> Optional[float]:
+        sym = base_pair(pair)
+        async with self._lock:
+            if time.time() - self._cache_ts > self._CACHE_TTL:
+                await self._refresh()
+        if not self._quotes:
+            return None
+        return self._derive(sym)
+
+    def _derive(self, sym: str) -> Optional[float]:
+        """Convert USD-based quotes to the requested pair rate."""
+        q = self._quotes
+        if len(sym) != 6:
+            return None
+
+        base3  = sym[:3]   # e.g. "EUR"
+        quote3 = sym[3:]   # e.g. "USD"
+
+        # Direct: e.g. USDJPY → key "USDJPY" or "JPY"
+        for key in (f"USD{quote3}", quote3):
+            if base3 == "USD" and key in q:
+                return q[key]
+
+        # Inverse: e.g. EURUSD → 1 / q["USDEUR"]
+        for key in (f"USD{base3}", base3):
+            if quote3 == "USD" and key in q:
+                v = q[key]
+                return (1.0 / v) if v else None
+
+        # Cross: e.g. EURJPY = q["USDJPY"] / q["USDEUR"]
+        usd_quote = q.get(f"USD{quote3}") or q.get(quote3)
+        usd_base  = q.get(f"USD{base3}")  or q.get(base3)
+        if usd_quote and usd_base and usd_base > 0:
+            return usd_quote / usd_base
+
+        return None
+
+
 # ─── Unified data provider ───────────────────────────────────────────────────
 
 class DataProvider:
     """
-    Tries each data source in priority order and returns the first success.
-    Priority: Yahoo Finance (free) → Quotex WS → TwelveData → AlphaVantage → Finnhub
+    OHLCV chain: Yahoo Finance → Quotex WS → TwelveData → AlphaVantage → Finnhub.
+    Spot-rate chain (for entry-price accuracy):
+        ExchangeRate.host (live, keyed) → Frankfurter (free ECB blend).
+    After every OHLCV fetch the last candle's close is patched with the freshest
+    available spot rate, so the signal entry price is as current as possible.
     """
 
     def __init__(self):
-        self.yahoo  = YahooFinanceClient()
-        self.quotex = QuotexWebSocketClient()
-        self.twelve = TwelveDataClient()
-        self.av     = AlphaVantageClient()
-        self.finnhub = FinnhubClient()
+        self.yahoo      = YahooFinanceClient()
+        self.quotex     = QuotexWebSocketClient()
+        self.twelve     = TwelveDataClient()
+        self.av         = AlphaVantageClient()
+        self.finnhub    = FinnhubClient()
+        self.erhost     = ExchangeRateHostClient()
+        self.frankfurter = FrankfurterClient()
+
+    # ── OHLCV fetch ───────────────────────────────────────────────────────────
 
     async def get_candles(
         self,
@@ -536,21 +669,58 @@ class DataProvider:
         ]
 
         min_rows = min(count, 30)
+        df = None
         for name, fn in sources:
             try:
                 df = await fn(pair, timeframe, count)
                 if df is not None and len(df) >= min_rows:
                     logger.debug("Data from %s for %s/%s (%d rows)", name, pair, timeframe, len(df))
-                    return df
+                    break
             except Exception as exc:
                 logger.warning("%s failed for %s/%s: %s", name, pair, timeframe, exc)
+                df = None
 
-        logger.error("All data sources failed for %s / %s — skipping.", pair, timeframe)
-        return None
+        if df is None or df.empty:
+            logger.error("All data sources failed for %s / %s — skipping.", pair, timeframe)
+            return None
+
+        # Patch last bar's close with freshest spot rate (M1 only — matters for entry price)
+        if timeframe == "M1":
+            spot = await self._get_spot(pair)
+            if spot is not None:
+                yf_close = float(df["close"].iloc[-1])
+                deviation = abs(spot - yf_close) / (yf_close + 1e-10)
+                if deviation < 0.01:              # sanity: reject if >1% off
+                    df = df.copy()
+                    df.iloc[-1, df.columns.get_loc("close")] = spot
+                    if spot > float(df["high"].iloc[-1]):
+                        df.iloc[-1, df.columns.get_loc("high")] = spot
+                    if spot < float(df["low"].iloc[-1]):
+                        df.iloc[-1, df.columns.get_loc("low")] = spot
+                    logger.debug("Spot patch %s: YF %.6f → spot %.6f (Δ %.4f%%)",
+                                 pair, yf_close, spot, deviation * 100)
+        return df
+
+    # ── Spot rate helpers ─────────────────────────────────────────────────────
+
+    async def _get_spot(self, pair: str) -> Optional[float]:
+        """Try ExchangeRate.host then Frankfurter; return None if both fail."""
+        spot = await self.erhost.get_spot_rate(pair)
+        if spot:
+            return spot
+        return await self.frankfurter.get_spot_rate(pair)
 
     async def get_current_price(self, pair: str) -> Optional[float]:
-        """Return latest close price for *pair* (M1 candle)."""
-        df = await self.get_candles(pair, "M1", 5)
+        """
+        Return the freshest possible price for *pair*.
+        Priority: ExchangeRate.host → Frankfurter → last YF M1 close.
+        """
+        spot = await self._get_spot(pair)
+        if spot:
+            logger.debug("Entry price for %s from spot API: %.6f", pair, spot)
+            return spot
+
+        df = await self.yahoo.get_candles(pair, "M1", 5)
         if df is not None and not df.empty:
             return float(df["close"].iloc[-1])
         return None

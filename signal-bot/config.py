@@ -20,9 +20,10 @@ QUOTEX_PASSWORD: str = os.getenv("QUOTEX_PASSWORD", "")
 QUOTEX_IS_DEMO: bool = os.getenv("QUOTEX_IS_DEMO", "True").lower() == "true"
 
 # ─── Backup API keys ─────────────────────────────────────────────────────────
-TWELVE_DATA_API_KEY: str = os.getenv("TWELVE_DATA_API_KEY", "")
-ALPHA_VANTAGE_API_KEY: str = os.getenv("ALPHA_VANTAGE_API_KEY", "")
-FINNHUB_API_KEY: str = os.getenv("FINNHUB_API_KEY", "")
+TWELVE_DATA_API_KEY: str        = os.getenv("TWELVE_DATA_API_KEY", "")
+ALPHA_VANTAGE_API_KEY: str      = os.getenv("ALPHA_VANTAGE_API_KEY", "")
+FINNHUB_API_KEY: str            = os.getenv("FINNHUB_API_KEY", "")
+EXCHANGERATE_HOST_KEY: str      = os.getenv("EXCHANGERATE_HOST_KEY", "")
 
 # ─── Timezone ────────────────────────────────────────────────────────────────
 TIMEZONE = "Asia/Karachi"   # PKT = UTC+5
