@@ -1,11 +1,11 @@
 {
-  "wins": 5,
-  "losses": 2,
-  "draws": 22,
-  "total_signals": 30,
-  "gross_profit": 50.0,
-  "gross_loss": 20.0,
-  "win_rate": 17.2,
-  "pnl": 30.0,
-  "total_trades": 29
+  "wins": 6,
+  "losses": 4,
+  "draws": 24,
+  "total_signals": 35,
+  "gross_profit": 60.0,
+  "gross_loss": 40.0,
+  "win_rate": 17.6,
+  "pnl": 20.0,
+  "total_trades": 34
 }
