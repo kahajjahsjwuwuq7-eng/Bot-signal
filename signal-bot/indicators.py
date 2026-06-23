@@ -336,6 +336,224 @@ def detect_chart_patterns(high: pd.Series, low: pd.Series, close: pd.Series) -> 
     return patterns
 
 
+# ─── Hull Moving Average ─────────────────────────────────────────────────────
+
+def _hma(series: pd.Series, period: int = 20) -> pd.Series:
+    """Hull Moving Average — half the lag of a WMA."""
+    half  = max(1, period // 2)
+    sqrt_p = max(1, int(period ** 0.5))
+    wma_h = series.ewm(span=half,   adjust=False).mean()
+    wma_f = series.ewm(span=period, adjust=False).mean()
+    return (2 * wma_h - wma_f).ewm(span=sqrt_p, adjust=False).mean()
+
+
+# ─── Supertrend ───────────────────────────────────────────────────────────────
+
+def _supertrend(
+    high: pd.Series, low: pd.Series, close: pd.Series,
+    period: int = 10, multiplier: float = 3.0,
+) -> pd.Series:
+    """Supertrend: returns +1 (bull) or -1 (bear) for each bar."""
+    atr  = _atr(high, low, close, period)
+    hl2  = (high + low) / 2
+    ub   = (hl2 + multiplier * atr).values
+    lb   = (hl2 - multiplier * atr).values
+    c    = close.values
+    fu   = ub.copy()
+    fl   = lb.copy()
+    t    = np.ones(len(c), dtype=np.int8)
+
+    for i in range(1, len(c)):
+        fu[i] = ub[i] if ub[i] < fu[i-1] or c[i-1] > fu[i-1] else fu[i-1]
+        fl[i] = lb[i] if lb[i] > fl[i-1] or c[i-1] < fl[i-1] else fl[i-1]
+        if t[i-1] == -1 and c[i] > fu[i]:
+            t[i] = 1
+        elif t[i-1] == 1 and c[i] < fl[i]:
+            t[i] = -1
+        else:
+            t[i] = t[i-1]
+
+    return pd.Series(t, index=close.index)
+
+
+# ─── Ichimoku Cloud ───────────────────────────────────────────────────────────
+
+def _ichimoku(high: pd.Series, low: pd.Series, close: pd.Series) -> dict:
+    """Return Tenkan, Kijun, Span A, Span B, Chikou."""
+    tenkan  = (high.rolling(9).max()  + low.rolling(9).min())  / 2
+    kijun   = (high.rolling(26).max() + low.rolling(26).min()) / 2
+    span_a  = ((tenkan + kijun) / 2).shift(26)          # current cloud = .iloc[-27]
+    span_b  = ((high.rolling(52).max() + low.rolling(52).min()) / 2).shift(26)
+    chikou  = close.shift(-26)
+    return {"tenkan": tenkan, "kijun": kijun,
+            "span_a": span_a, "span_b": span_b, "chikou": chikou}
+
+
+# ─── VWAP ────────────────────────────────────────────────────────────────────
+
+def _vwap(high: pd.Series, low: pd.Series, close: pd.Series,
+          volume: pd.Series) -> pd.Series:
+    tp  = (high + low + close) / 3
+    cum = (tp * volume).cumsum()
+    vol = volume.cumsum().replace(0, np.nan)
+    return cum / vol
+
+
+# ─── Money Flow Index ─────────────────────────────────────────────────────────
+
+def _mfi(high: pd.Series, low: pd.Series, close: pd.Series,
+         volume: pd.Series, period: int = 14) -> pd.Series:
+    tp  = (high + low + close) / 3
+    mf  = tp * volume
+    pos = mf.where(tp > tp.shift(1), 0.0)
+    neg = mf.where(tp < tp.shift(1), 0.0)
+    mfr = pos.rolling(period).sum() / neg.rolling(period).sum().replace(0, np.nan)
+    return 100 - (100 / (1 + mfr))
+
+
+# ─── Chaikin Money Flow ───────────────────────────────────────────────────────
+
+def _cmf(high: pd.Series, low: pd.Series, close: pd.Series,
+         volume: pd.Series, period: int = 20) -> pd.Series:
+    clv = ((close - low) - (high - close)) / (high - low + 1e-10)
+    return (clv * volume).rolling(period).sum() / \
+           volume.rolling(period).sum().replace(0, np.nan)
+
+
+# ─── Heikin Ashi trend ────────────────────────────────────────────────────────
+
+def _heikin_ashi_trend(
+    open_: pd.Series, high: pd.Series, low: pd.Series,
+    close: pd.Series, bars: int = 5,
+) -> tuple[int, int]:
+    """Return (bull_bars, bear_bars) among the last *bars* Heikin Ashi candles."""
+    ha_close = (open_ + high + low + close) / 4
+    hac = ha_close.values.copy()
+    hao = hac.copy()                     # start HA open = HA close
+    for i in range(1, len(hao)):
+        hao[i] = (hao[i-1] + hac[i-1]) / 2
+    bull = int(np.sum(hac[-bars:] > hao[-bars:]))
+    return bull, bars - bull
+
+
+# ─── RSI Divergence ───────────────────────────────────────────────────────────
+
+def detect_rsi_divergence(
+    close: pd.Series, rsi_series: pd.Series, lookback: int = 25,
+) -> str:
+    """
+    Returns 'BULL', 'BEAR', or 'NONE'.
+    Bullish: price makes lower low but RSI makes higher low  → BUY.
+    Bearish: price makes higher high but RSI makes lower high → SELL.
+    """
+    if len(close) < lookback + 5:
+        return "NONE"
+    c = close.iloc[-lookback:].dropna()
+    r = rsi_series.iloc[-lookback:].reindex(c.index).ffill().dropna()
+    if len(r) < 10 or r.isna().all():
+        return "NONE"
+
+    c  = c.reindex(r.index)
+    rng = float(c.max() - c.min())
+    if rng == 0:
+        return "NONE"
+
+    last_c = float(c.iloc[-1])
+    last_r = float(r.iloc[-1])
+
+    price_near_low  = (last_c - float(c.min())) / rng < 0.2
+    rsi_above_low   = last_r > float(r.min()) + 3          # RSI noticeably higher than its low
+    price_near_high = (float(c.max()) - last_c) / rng < 0.2
+    rsi_below_high  = last_r < float(r.max()) - 3          # RSI noticeably lower than its high
+
+    if price_near_low and rsi_above_low and last_r < 55:
+        return "BULL"
+    if price_near_high and rsi_below_high and last_r > 45:
+        return "BEAR"
+    return "NONE"
+
+
+# ─── SMC — Break of Structure ─────────────────────────────────────────────────
+
+def detect_smc_bos(
+    high: pd.Series, low: pd.Series, close: pd.Series, lookback: int = 20
+) -> dict:
+    """Bullish BOS: close breaks above the last swing high. Bearish: below swing low."""
+    if len(close) < lookback + 3:
+        return {"bullish_bos": False, "bearish_bos": False}
+    swing_high = float(high.iloc[-lookback:-2].max())
+    swing_low  = float(low.iloc[-lookback:-2].min())
+    prev  = float(close.iloc[-2])
+    curr  = float(close.iloc[-1])
+    return {
+        "bullish_bos": prev <= swing_high < curr,
+        "bearish_bos": curr < swing_low  <= prev,
+    }
+
+
+# ─── SMC — Order Blocks ───────────────────────────────────────────────────────
+
+def detect_order_blocks(
+    open_: pd.Series, high: pd.Series, low: pd.Series,
+    close: pd.Series, lookback: int = 40,
+) -> dict:
+    """
+    Demand OB: last bearish candle before a 2×ATR bullish impulse.
+    Supply OB: last bullish candle before a 2×ATR bearish impulse.
+    Returns True if current price sits inside a recent OB zone.
+    """
+    if len(close) < lookback + 5:
+        return {"ob_bull": False, "ob_bear": False}
+
+    atr_val = float(_atr(high, low, close, 14).iloc[-1])
+    curr    = float(close.iloc[-1])
+    o = open_.values[-lookback:]
+    h = high.values[-lookback:]
+    l = low.values[-lookback:]
+    c = close.values[-lookback:]
+
+    demand, supply = [], []
+    for i in range(1, len(c) - 3):
+        if c[i] < o[i]:                                   # bearish candle
+            if max(h[i+1:i+4]) - c[i] > 2 * atr_val:    # strong bullish impulse after
+                demand.append((l[i], h[i]))
+        if c[i] > o[i]:                                   # bullish candle
+            if o[i] - min(l[i+1:i+4]) > 2 * atr_val:    # strong bearish impulse after
+                supply.append((l[i], h[i]))
+
+    ob_bull = any(lo <= curr <= hi for lo, hi in demand[-5:])
+    ob_bear = any(lo <= curr <= hi for lo, hi in supply[-5:])
+    return {"ob_bull": ob_bull, "ob_bear": ob_bear}
+
+
+# ─── SMC — Fair Value Gaps ────────────────────────────────────────────────────
+
+def detect_fvg(
+    high: pd.Series, low: pd.Series, close: pd.Series, lookback: int = 30
+) -> dict:
+    """
+    Bullish FVG: candle[i+1].low > candle[i-1].high — gap above, price has momentum.
+    Bearish FVG: candle[i+1].high < candle[i-1].low — gap below.
+    Only signals when current price is beyond the gap (unfilled impulse).
+    """
+    if len(close) < lookback + 3:
+        return {"fvg_bull": False, "fvg_bear": False}
+
+    h = high.values
+    l = low.values
+    c = close.values
+    curr = c[-1]
+    bull_fvg = bear_fvg = False
+
+    for i in range(max(1, len(c) - lookback), len(c) - 2):
+        if l[i+1] > h[i-1] and curr > l[i+1]:           # bullish FVG, price above gap
+            bull_fvg = True
+        if h[i+1] < l[i-1] and curr < h[i+1]:           # bearish FVG, price below gap
+            bear_fvg = True
+
+    return {"fvg_bull": bull_fvg, "fvg_bear": bear_fvg}
+
+
 # ─── Breakout / Liquidity ────────────────────────────────────────────────────
 
 def detect_breakout(close: pd.Series, high: pd.Series, low: pd.Series,
@@ -387,6 +605,16 @@ class AnalysisResult:
     support_resistance: dict = field(default_factory=dict)
     breakout: dict = field(default_factory=dict)
     liquidity: dict = field(default_factory=dict)
+    # ── Advanced fields ──────────────────────────────────────────────────────
+    supertrend_bull: bool = False
+    hma_bull: bool = False
+    ichimoku_bull: bool | None = None    # None = inside cloud / indeterminate
+    rsi_divergence: str = "NONE"         # BULL / BEAR / NONE
+    order_block: dict = field(default_factory=dict)
+    fvg: dict = field(default_factory=dict)
+    bos: dict = field(default_factory=dict)
+    vwap: float = 0.0
+    mfi: float = 50.0
     valid: bool = False                  # passes all signal conditions
 
 
@@ -468,6 +696,54 @@ def analyse(df: pd.DataFrame) -> AnalysisResult:
 
     # Current price
     current_price = float(c.iloc[-1])
+
+    # ── Advanced indicators ────────────────────────────────────────────────────
+    # Supertrend
+    st_series  = _supertrend(h, l, c, period=10, multiplier=3.0)
+    st_bull    = int(st_series.iloc[-1]) == 1
+
+    # Hull MA
+    hma_series = _hma(c, 20)
+    hma_val    = float(hma_series.iloc[-1]) if not pd.isna(hma_series.iloc[-1]) else current_price
+    hma_slope  = float(hma_series.diff(3).iloc[-1]) if len(hma_series) > 3 else 0.0
+
+    # Ichimoku
+    ichi       = _ichimoku(h, l, c)
+    tenkan_val = float(ichi["tenkan"].iloc[-1]) if not pd.isna(ichi["tenkan"].iloc[-1]) else None
+    kijun_val  = float(ichi["kijun"].iloc[-1])  if not pd.isna(ichi["kijun"].iloc[-1])  else None
+    # Cloud at current bar = span_a/b calculated 26 bars ago and projected forward
+    span_a_now = float(ichi["span_a"].iloc[-27]) if len(ichi["span_a"]) > 27 and not pd.isna(ichi["span_a"].iloc[-27]) else None
+    span_b_now = float(ichi["span_b"].iloc[-27]) if len(ichi["span_b"]) > 27 and not pd.isna(ichi["span_b"].iloc[-27]) else None
+
+    # VWAP
+    has_vol  = bool(float(v.max()) > 0)
+    vwap_val = 0.0
+    if has_vol:
+        vwap_s   = _vwap(h, l, c, v)
+        vwap_val = float(vwap_s.iloc[-1]) if not pd.isna(vwap_s.iloc[-1]) else 0.0
+
+    # MFI
+    mfi_val = 50.0
+    if has_vol:
+        mfi_s   = _mfi(h, l, c, v, 14)
+        mfi_val = float(mfi_s.iloc[-1]) if not pd.isna(mfi_s.iloc[-1]) else 50.0
+
+    # CMF
+    cmf_val = 0.0
+    if has_vol:
+        cmf_s   = _cmf(h, l, c, v, 20)
+        cmf_val = float(cmf_s.iloc[-1]) if not pd.isna(cmf_s.iloc[-1]) else 0.0
+
+    # Heikin Ashi trend
+    ha_bull_bars, ha_bear_bars = _heikin_ashi_trend(o, h, l, c, bars=5)
+
+    # RSI Divergence
+    rsi_div = detect_rsi_divergence(c, rsi_series)
+
+    # SMC
+    bos_data = detect_smc_bos(h, l, c)
+    ob_data  = detect_order_blocks(o, h, l, c)
+    fvg_data = detect_fvg(h, l, c)
 
     # ── Candlestick patterns ──────────────────────────────────────────────────
     candle_pats = detect_candlestick_patterns(o, h, l, c)
@@ -589,6 +865,55 @@ def analyse(df: pd.DataFrame) -> AnalysisResult:
         if vol_rising:
             vote(obv_slope > 0, obv_slope < 0, weight=1)   # extra confirmation
 
+    # ── Advanced indicator votes ───────────────────────────────────────────────
+
+    # 19. Supertrend (highly reliable ATR-based trend follower)
+    vote(st_bull, not st_bull, weight=3)
+
+    # 20. Hull Moving Average (less lag, tracks trend quickly)
+    hma_bull_now = hma_slope > 0 and current_price > hma_val
+    hma_bear_now = hma_slope < 0 and current_price < hma_val
+    vote(hma_bull_now, hma_bear_now, weight=2)
+
+    # 21. Ichimoku — TK cross (weight 2)
+    if tenkan_val is not None and kijun_val is not None:
+        vote(tenkan_val > kijun_val, tenkan_val < kijun_val, weight=2)
+
+    # 22. Ichimoku — price vs cloud (weight 2)
+    if span_a_now is not None and span_b_now is not None:
+        cloud_top = max(span_a_now, span_b_now)
+        cloud_bot = min(span_a_now, span_b_now)
+        vote(current_price > cloud_top, current_price < cloud_bot, weight=2)
+
+    # 23. Heikin Ashi — 4 or 5 consecutive HA candles (strong trend)
+    vote(ha_bull_bars >= 4, ha_bear_bars >= 4, weight=2)
+    vote(ha_bull_bars >= 3, ha_bear_bars >= 3, weight=1)    # softer bias
+
+    # 24. RSI Divergence (highest-weight reversal signal)
+    vote(rsi_div == "BULL", rsi_div == "BEAR", weight=4)
+
+    # 25. SMC — Break of Structure
+    vote(bos_data["bullish_bos"], bos_data["bearish_bos"], weight=3)
+
+    # 26. SMC — Order Blocks (institutional demand/supply zones)
+    vote(ob_data["ob_bull"], ob_data["ob_bear"], weight=3)
+
+    # 27. SMC — Fair Value Gaps (momentum imbalance)
+    vote(fvg_data["fvg_bull"], fvg_data["fvg_bear"], weight=2)
+
+    # 28. VWAP (only when volume data is real)
+    if has_vol and vwap_val > 0:
+        vote(current_price > vwap_val, current_price < vwap_val, weight=2)
+
+    # 29. MFI — momentum with volume
+    if has_vol:
+        vote(mfi_val < 20, mfi_val > 80, weight=2)
+        vote(mfi_val < 40, mfi_val > 60, weight=1)
+
+    # 30. CMF — Chaikin money flow
+    if has_vol:
+        vote(cmf_val > 0.1, cmf_val < -0.1, weight=1)
+
     # ─── Determine direction ──────────────────────────────────────────────────
     if buy_score >= sell_score:
         direction: Direction = "BUY"
@@ -630,6 +955,17 @@ def analyse(df: pd.DataFrame) -> AnalysisResult:
         soft_ok
     )
 
+    # ── Ichimoku cloud direction summary ──────────────────────────────────────
+    ichi_bull: bool | None = None
+    if span_a_now is not None and span_b_now is not None:
+        cloud_top = max(span_a_now, span_b_now)
+        cloud_bot = min(span_a_now, span_b_now)
+        if current_price > cloud_top:
+            ichi_bull = True
+        elif current_price < cloud_bot:
+            ichi_bull = False
+        # else: inside cloud → None
+
     result.direction = direction
     result.strength = round(strength, 1)
     result.agreements = agreements
@@ -648,5 +984,15 @@ def analyse(df: pd.DataFrame) -> AnalysisResult:
     result.support_resistance = sr
     result.breakout = bo
     result.liquidity = liq
+    # advanced
+    result.supertrend_bull = st_bull
+    result.hma_bull        = hma_bull_now
+    result.ichimoku_bull   = ichi_bull
+    result.rsi_divergence  = rsi_div
+    result.order_block     = ob_data
+    result.fvg             = fvg_data
+    result.bos             = bos_data
+    result.vwap            = round(vwap_val, 6)
+    result.mfi             = round(mfi_val, 1)
     result.valid = valid
     return result
