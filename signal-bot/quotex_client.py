@@ -30,6 +30,25 @@ from config import (
 )
 from utils import logger, async_retry, base_pair
 
+# ─── Yahoo Finance symbol map ────────────────────────────────────────────────
+
+_YAHOO_SYMBOLS: dict[str, str] = {
+    "EURUSD": "EURUSD=X",
+    "GBPUSD": "GBPUSD=X",
+    "AUDUSD": "AUDUSD=X",
+    "USDJPY": "USDJPY=X",
+    "EURJPY": "EURJPY=X",
+    "USDCAD": "USDCAD=X",
+    "AUDCAD": "AUDCAD=X",
+    "EURGBP": "EURGBP=X",
+    "BTCUSD": "BTC-USD",
+    "ETHUSD": "ETH-USD",
+    "XAUUSD": "GC=F",
+}
+
+_TF_TO_YAHOO: dict[str, str] = {"M1": "1m", "M5": "5m", "M15": "15m"}
+_YAHOO_PERIOD: dict[str, str] = {"M1": "1d", "M5": "5d", "M15": "5d"}
+
 # ─── Symbol mappings ─────────────────────────────────────────────────────────
 
 _TWELVE_DATA_SYMBOLS: dict[str, str] = {
@@ -89,6 +108,70 @@ def _build_df(rows: list[dict]) -> pd.DataFrame:
     df.sort_index(inplace=True)
     df.dropna(subset=["open", "high", "low", "close"], inplace=True)
     return df[["open", "high", "low", "close", "volume"]]
+
+
+# ─── Yahoo Finance client (free, no API key) ─────────────────────────────────
+
+class YahooFinanceClient:
+    """
+    Free real-time OHLCV data via yfinance — no API key required.
+    Supports M1 / M5 / M15 for all forex pairs, BTC, ETH, and gold.
+    Used as the primary data source; others serve as fallbacks.
+    """
+
+    async def get_candles(
+        self, pair: str, timeframe: str = "M1", count: int = CANDLE_COUNT
+    ) -> Optional[pd.DataFrame]:
+        sym = base_pair(pair)
+        yahoo_sym = _YAHOO_SYMBOLS.get(sym)
+        if not yahoo_sym:
+            return None
+
+        interval = _TF_TO_YAHOO.get(timeframe, "1m")
+        period   = _YAHOO_PERIOD.get(timeframe, "1d")
+
+        try:
+            import yfinance as yf
+            # yfinance is sync — run in executor so we don't block the event loop
+            loop = asyncio.get_event_loop()
+            df = await loop.run_in_executor(
+                None,
+                lambda: yf.download(
+                    yahoo_sym,
+                    period=period,
+                    interval=interval,
+                    progress=False,
+                    auto_adjust=True,
+                ),
+            )
+            if df is None or df.empty:
+                return None
+
+            # Flatten multi-index columns if present (yfinance ≥0.2.x)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+
+            df.columns = [c.lower() for c in df.columns]
+            df = df.rename(columns={"vol": "volume"})
+            for col in ("open", "high", "low", "close"):
+                if col not in df.columns:
+                    return None
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            if "volume" not in df.columns:
+                df["volume"] = 0.0
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+            df = df[["open", "high", "low", "close", "volume"]].dropna(
+                subset=["open", "high", "low", "close"]
+            )
+            df = df.tail(count)
+            logger.info(
+                "YahooFinance: got %d candles for %s %s", len(df), pair, timeframe
+            )
+            return df if not df.empty else None
+
+        except Exception as exc:
+            logger.warning("YahooFinance request failed for %s/%s: %s", pair, timeframe, exc)
+            return None
 
 
 # ─── Quotex WebSocket client ─────────────────────────────────────────────────
@@ -428,13 +511,14 @@ class FinnhubClient:
 class DataProvider:
     """
     Tries each data source in priority order and returns the first success.
-    Priority: Quotex WS → TwelveData → AlphaVantage → Finnhub
+    Priority: Yahoo Finance (free) → Quotex WS → TwelveData → AlphaVantage → Finnhub
     """
 
     def __init__(self):
+        self.yahoo  = YahooFinanceClient()
         self.quotex = QuotexWebSocketClient()
         self.twelve = TwelveDataClient()
-        self.av = AlphaVantageClient()
+        self.av     = AlphaVantageClient()
         self.finnhub = FinnhubClient()
 
     async def get_candles(
@@ -444,13 +528,14 @@ class DataProvider:
         count: int = CANDLE_COUNT,
     ) -> Optional[pd.DataFrame]:
         sources = [
-            ("Quotex WS", self.quotex.get_candles),
-            ("TwelveData", self.twelve.get_candles),
+            ("YahooFinance", self.yahoo.get_candles),
+            ("Quotex WS",    self.quotex.get_candles),
+            ("TwelveData",   self.twelve.get_candles),
             ("AlphaVantage", self.av.get_candles),
-            ("Finnhub", self.finnhub.get_candles),
+            ("Finnhub",      self.finnhub.get_candles),
         ]
 
-        min_rows = min(count, 30)   # price-only fetches (count≤10) don't need 30 rows
+        min_rows = min(count, 30)
         for name, fn in sources:
             try:
                 df = await fn(pair, timeframe, count)
