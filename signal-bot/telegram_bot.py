@@ -415,20 +415,22 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ─── Candle-boundary timing ───────────────────────────────────────────────────
 
-SIGNAL_EARLY_SECS = 15   # send signal this many seconds before candle opens
+SIGNAL_EARLY_SECS = 40   # wake 40 s early → analysis (~8 s) done by :28 → 30 s to enter
 
 def _secs_until_next_signal() -> float:
     """
     Return seconds to sleep so we wake up exactly SIGNAL_EARLY_SECS before
-    the next UTC minute boundary (i.e. at HH:MM:45 UTC for M1 candles).
+    the next UTC minute boundary (i.e. at HH:MM:20 UTC for M1 candles).
+    Analysis takes ~8 s, so the signal arrives around HH:MM:28 — giving
+    the user ~30 s to enter before the candle opens at HH:(MM+1):00.
     """
     now_utc   = _time.time()
     secs_in   = now_utc % 60                        # how far into this minute
-    fire_at   = 60 - SIGNAL_EARLY_SECS              # :45 within the minute
+    fire_at   = 60 - SIGNAL_EARLY_SECS              # :20 within the minute
     if secs_in < fire_at:
-        return fire_at - secs_in                    # still before :45 this min
+        return fire_at - secs_in                    # still before :20 this min
     else:
-        return 60 - secs_in + fire_at               # past :45 — wait for next
+        return 60 - secs_in + fire_at               # past :20 — wait for next
 
 
 def _next_candle_open_pkt() -> str:

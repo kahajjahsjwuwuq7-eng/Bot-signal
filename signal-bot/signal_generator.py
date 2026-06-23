@@ -1,7 +1,7 @@
 """
 signal_generator.py — Orchestrates the full signal lifecycle:
-  1. Send signal (15s before candle opens)
-  2. Wait 75s (15s prep + 60s M1 expiry)
+  1. Send signal (~30 s before candle opens)
+  2. Wait dynamically until candle closes (time-to-open + 60 s M1 expiry)
   3. Determine WIN / LOSS / DRAW
   4. Send result message
   5. Update stats
@@ -26,8 +26,7 @@ SendFn = Callable[[str], Awaitable[None]]
 _HEADER   = "𝙌𝙐𝙊𝙏𝙀𝙓 𝘽𝙍𝙊𝙆𝙀𝙍"
 _AVOID    = "⚡️  𝘼𝙑𝙊𝙄𝘿 𝘿𝙊𝙅𝙄 𝘾𝘼𝙉𝘿𝙇𝙀𝙎  ⚡️"
 
-# Seconds the user has to place the trade before candle opens
-PREP_SECONDS = 15
+import time as _time
 
 
 def _fmt_signal_pair(pair: str) -> str:
@@ -99,12 +98,21 @@ class SignalGenerator:
     # ─── Wait for expiry ─────────────────────────────────────────────────────
 
     async def wait_expiry(self) -> None:
-        """Wait PREP_SECONDS + candle duration so result is after candle close."""
+        """
+        Sleep until the traded candle has fully closed.
+        Dynamically calculates time-to-next-candle-open from the current
+        clock, then adds the full candle duration — works correctly regardless
+        of when the signal was sent within the minute.
+        """
         candle_secs = TIMEFRAME_SECONDS.get(self.timeframe, 60)
-        total = PREP_SECONDS + candle_secs
+        secs_in      = _time.time() % 60          # seconds elapsed in this minute
+        secs_to_open = (60 - secs_in) % 60        # time until next :00 boundary
+        if secs_to_open < 2:                       # avoid checking at the exact boundary
+            secs_to_open += 60
+        total = int(secs_to_open) + candle_secs + 3   # +3 s margin for latency
         logger.info(
-            "Waiting %ds (%ds prep + %ds candle) for result…",
-            total, PREP_SECONDS, candle_secs,
+            "Waiting %ds (~%.0fs to open + %ds candle) for result…",
+            total, secs_to_open, candle_secs,
         )
         await asyncio.sleep(total)
 
