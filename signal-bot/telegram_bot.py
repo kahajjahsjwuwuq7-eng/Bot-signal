@@ -18,6 +18,7 @@ import json
 import os
 import signal
 import sys
+import time as _time
 from typing import Optional
 
 from telegram import Update, Bot
@@ -248,45 +249,85 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
+# ─── Candle-boundary timing ───────────────────────────────────────────────────
+
+SIGNAL_EARLY_SECS = 15   # send signal this many seconds before candle opens
+
+def _secs_until_next_signal() -> float:
+    """
+    Return seconds to sleep so we wake up exactly SIGNAL_EARLY_SECS before
+    the next UTC minute boundary (i.e. at HH:MM:45 UTC for M1 candles).
+    """
+    now_utc   = _time.time()
+    secs_in   = now_utc % 60                        # how far into this minute
+    fire_at   = 60 - SIGNAL_EARLY_SECS              # :45 within the minute
+    if secs_in < fire_at:
+        return fire_at - secs_in                    # still before :45 this min
+    else:
+        return 60 - secs_in + fire_at               # past :45 — wait for next
+
+
+def _next_candle_open_pkt() -> str:
+    """
+    Return the next UTC minute boundary formatted as HH:MM PKT.
+    This is the candle open time the user should enter the trade on.
+    """
+    import math
+    from datetime import datetime, timezone
+    import pytz
+    now_utc       = _time.time()
+    secs_in       = now_utc % 60
+    next_open_utc = now_utc + (60 - secs_in)        # next :00 UTC
+    dt_utc        = datetime.fromtimestamp(next_open_utc, tz=timezone.utc)
+    dt_pkt        = dt_utc.astimezone(pytz.timezone("Asia/Karachi"))
+    return dt_pkt.strftime("%H:%M")
+
+
 # ─── Auto-scan loop ───────────────────────────────────────────────────────────
 
 async def scan_loop() -> None:
     """
-    Main scanning loop — runs every SCAN_INTERVAL_SECONDS.
-    Finds best pair, runs full signal lifecycle, repeats.
+    Candle-aligned scan loop.
+    Wakes at :45 of each UTC minute (15 s before the M1 candle opens),
+    scans all pairs, and fires the signal so the user can enter right at
+    the candle open (:00 of the next minute).
     """
     global _running
     logger.info("🚀 Scan loop started at %s", fmt_pkt())
     await broadcast(
         "🟢 *Quotex Signal Bot STARTED*\n"
-        f"📡 Scanning {len(PAIRS)} OTC pairs every {SCAN_INTERVAL_SECONDS}s\n"
+        f"📡 Scanning {len(PAIRS)} OTC pairs — aligned to candle clock\n"
         f"🕐 {fmt_pkt()}"
     )
 
     while _running:
-        cycle_start = asyncio.get_event_loop().time()
+        # ── Wait until 15 s before next candle open ──────────────────────────
+        sleep_secs = _secs_until_next_signal()
+        logger.debug("Sleeping %.1fs until next signal window…", sleep_secs)
+        await asyncio.sleep(sleep_secs)
+
+        if not _running:
+            break
+
+        logger.info("🔍 Scanning 11 pairs at %s", fmt_pkt())
+
         try:
             score = await selector.select_best_pair()
 
             if score is not None:
-                await generator.run_signal_cycle(score)
+                # Pass the candle open time so the signal message shows it
+                await generator.run_signal_cycle(
+                    score, candle_open_time=_next_candle_open_pkt()
+                )
             else:
                 logger.info("No qualifying pair this cycle — waiting…")
-                # Small status nudge every 10 skipped cycles
-                # (handled via counter in production)
 
         except asyncio.CancelledError:
             logger.info("Scan loop cancelled.")
             break
         except Exception as exc:
             logger.error("Scan loop error: %s", exc, exc_info=True)
-            await asyncio.sleep(10)
-
-        # Sleep until the next minute boundary
-        elapsed = asyncio.get_event_loop().time() - cycle_start
-        sleep_time = max(0, SCAN_INTERVAL_SECONDS - elapsed)
-        logger.debug("Cycle done in %.1fs — sleeping %.1fs", elapsed, sleep_time)
-        await asyncio.sleep(sleep_time)
+            await asyncio.sleep(5)
 
     logger.info("Scan loop exited.")
 

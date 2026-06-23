@@ -57,9 +57,13 @@ class SignalGenerator:
 
     # ─── Signal message ───────────────────────────────────────────────────────
 
-    def _build_signal_message(self, score: PairScore) -> str:
-        time_str     = fmt_time_only(now_pkt())
+    def _build_signal_message(
+        self, score: PairScore, candle_open_time: str | None = None
+    ) -> str:
         pair_display = _fmt_signal_pair(score.pair)
+
+        # Show the candle open time (entry time) if provided, else current time
+        entry_time = candle_open_time if candle_open_time else fmt_time_only(now_pkt())
 
         if score.direction == "BUY":
             direction_line = "💀 GO FOR UP 🔼"
@@ -71,7 +75,7 @@ class SignalGenerator:
             "",
             f"📊 {pair_display}",
             "",
-            f"✔️ Time  : {time_str} (PKT 🇵🇰)",
+            f"✔️ Entry : {entry_time} (PKT 🇵🇰)",
             f"⏳ Frame : {self.timeframe}",
             "",
             direction_line,
@@ -80,13 +84,16 @@ class SignalGenerator:
         ]
         return "\n".join(lines)
 
-    async def send_signal(self, score: PairScore) -> None:
-        msg = self._build_signal_message(score)
+    async def send_signal(
+        self, score: PairScore, candle_open_time: str | None = None
+    ) -> None:
+        msg = self._build_signal_message(score, candle_open_time)
         await self.send(msg)
         await self.tracker.record_signal()
         logger.info(
-            "Signal sent: %s | %s | %.1f%%",
+            "Signal sent: %s | %s | %.1f%% | entry=%s",
             score.pair, score.direction, score.strength,
+            candle_open_time or "now",
         )
 
     # ─── Wait for expiry ─────────────────────────────────────────────────────
@@ -153,7 +160,9 @@ class SignalGenerator:
 
     # ─── Full lifecycle ───────────────────────────────────────────────────────
 
-    async def run_signal_cycle(self, score: PairScore) -> None:
+    async def run_signal_cycle(
+        self, score: PairScore, candle_open_time: str | None = None
+    ) -> None:
         logger.info("=== Signal cycle start: %s ===", score.pair)
 
         # 1. Capture entry price from scan result (no extra API call)
@@ -173,10 +182,10 @@ class SignalGenerator:
                     await asyncio.sleep(8)
             logger.info("Entry price for %s (fetched): %s", score.pair, entry_price)
 
-        # 2. Send signal immediately (user has PREP_SECONDS to place trade)
-        await self.send_signal(score)
+        # 2. Send signal with entry time shown as candle open time
+        await self.send_signal(score, candle_open_time=candle_open_time)
 
-        # 3. Wait prep + candle duration
+        # 3. Wait for candle to close (PREP_SECONDS already elapsed while user placed trade)
         await self.wait_expiry()
 
         # 4. Determine result
