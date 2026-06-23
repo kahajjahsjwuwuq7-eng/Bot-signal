@@ -32,7 +32,7 @@ task = "shell.exec"
 args = "bash -l -c 'cd signal-bot && python3 telegram_bot.py'"
 
 [agent]
-stack = "PNPM_WORKSPACE"
+stack = "BEST_EFFORT_FALLBACK"
 expertMode = true
 
 [postMerge]
@@ -50,8 +50,3 @@ externalPort = 8081
 [userenv]
 
 [userenv.shared]
-TWELVE_DATA_API_KEY = "6ea3052e44854e5bab8196b3f0e2289f"
-ALPHA_VANTAGE_API_KEY = "KZIXNMYIFFFFXX7H"
-FINNHUB_API_KEY = "d25bvkpr01qns40e7jggd25bvkpr01qns40e7jh0"
-TELEGRAM_BOT_TOKEN = "8841228801:AAEeyzKOvDTSAbjHzyi4UsEiFPgzRNg6Gf8"
-TELEGRAM_CHAT_ID = "5275144830"
